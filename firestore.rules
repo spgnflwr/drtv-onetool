@@ -1,0 +1,18 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // @springnflower.com 메일 링크로 로그인하고 메일 인증이 끝난 사용자만
+    function staff() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.matches('.*@springnflower[.]com$');
+    }
+    match /data/team/springnflower/{document=**} {
+      allow read, write: if staff();
+    }
+    // 그 밖의 경로는 모두 차단
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
