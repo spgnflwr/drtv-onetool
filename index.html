@@ -206,6 +206,29 @@ code{font-size:12px;background:var(--soft);padding:1px 5px;border-radius:4px}
     return dt;
   }
 
+  // 비고(방송일) 해석 규칙 (약속된 표기: "11/3,10,17" — 첫 날짜에 월 표기, 쉼표 구분)
+  // 정상 처리: 띄어쓰기 제거("11/3, 10" → "11/3,10"), "11월3일" 같은 날짜 표기 → "11/3", 엑셀 날짜값
+  // 오류: 비고 빈칸, 첫 날짜에 월 없음("3,10"), 기간("11/3~7"), 요일·괄호 등 약속과 다른 표기, 없는 날짜("11/31")
+  function parseDays(raw, y, pm, tokenMonth) {
+    const out = { dates: [], bad: [], blank: false, why: '' };
+    if (isBlank(raw)) { out.blank = true; return out; }
+    if (typeof raw === 'number' && raw > 20000) { out.dates.push(new Date(Date.UTC(1899, 11, 30) + Math.round(raw) * 864e5)); return out; }
+    const orig = s(raw);
+    let str = orig.replace(/[ \t\u00a0]/g, '').replace(/(\d{1,2})월(\d{1,2})일?/g, '$1/$2').replace(/(\d{1,2})일/g, '$1');
+    const toks = str.split(',');
+    if (!toks.length || toks.some(t => !/^(\d{1,2}\/)?\d{1,2}$/.test(t))) { out.bad.push(orig); out.why = /~|-/.test(str) ? '기간 표기(~)는 약속된 형식이 아님' : /[()（）]/.test(str) ? '괄호·요일 표기는 약속된 형식이 아님' : '약속된 형식(11/3,10,17)이 아님'; return out; }
+    if (!toks[0].includes('/')) { out.bad.push(orig); out.why = '첫 날짜에 월 표기가 없음 (예: 11/3,10)'; return out; }
+    let curM = pm; const dates = [];
+    for (const tk of toks) {
+      const parts = tk.split('/');
+      if (parts.length === 2) curM = tokenMonth ? +parts[0] : pm;
+      const dt = y && curM ? mkDate(y, curM, +parts[parts.length - 1]) : null;
+      if (!dt) { out.bad.push(orig); out.why = `없는 날짜 (${tk})`; return out; }
+      dates.push(dt);
+    }
+    out.dates = dates; return out;
+  }
+
   /* ---------- 표 읽기 도우미 ---------- */
   function sheetRows(XLSX, ws) { return XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null }); }
   function tableFrom(rows, hdrIdx) {
@@ -335,23 +358,20 @@ code{font-size:12px;background:var(--soft);padding:1px 5px;border-radius:4px}
       const per = sh.period;
       const y = parseInt(per.slice(0, 4), 10), pm = parseInt(per.slice(5, 7), 10);
       if (!y || !pm) W('error', '기간', `[${sh.sheet}] 집행기간을 읽지 못했습니다: "${per}"`);
-      let declared = 0, made = 0;
+      let declared = 0, made = 0; const badRows = [];
       sh.rows.forEach((r, ri) => {
         const cnt = toNum(r['횟수']); declared += cnt;
-        const toks = s(isBlank(r['비고']) ? 0 : r['비고']).replace(/ /g, '').split(',');
+        const pd = parseDays(r['비고'], y, pm, tokenMonth);
+        if (pd.blank) { badRows.push({ r, why: '비고(방송일)가 비어 있음', cnt }); return; }
+        if (pd.bad.length) { badRows.push({ r, why: `비고 "${pd.bad[0]}" · ${pd.why}`, cnt }); return; }
+        const dates = pd.dates;
         let perDay = 1;
-        if (fixMulti && toks.length && cnt > 0) {
-          const q = cnt / toks.length;
+        if (fixMulti && dates.length && cnt > 0) {
+          const q = cnt / dates.length;
           if (Number.isInteger(q) && q >= 1) perDay = q;
-          else W('warn', '횟수', `[${sh.sheet}] ${s(r['프로그램'])} ${s(r['시작'])}: 횟수 ${cnt} 가 일자 ${toks.length}개로 나눠지지 않아 일자당 1회로 처리`, s(r['비고']));
+          else W('warn', '횟수', `[${sh.sheet}] ${s(r['프로그램'])} ${s(r['시작'])}: 횟수 ${cnt} 가 일자 ${dates.length}개로 나눠지지 않아 일자당 1회로 처리`, s(r['비고']));
         }
-        let curM = pm;
-        toks.forEach(tk => {
-          const parts = tk.split('/');
-          if (tokenMonth && parts.length >= 2 && /^\d+$/.test(parts[parts.length - 2])) curM = parseInt(parts[parts.length - 2], 10);
-          const dd = parseInt(parts[parts.length - 1], 10);
-          const dt = (y && (tokenMonth ? curM : pm) && dd) ? mkDate(y, tokenMonth ? curM : pm, dd) : null;
-          if (!dt) { W('error', '날짜', `[${sh.sheet}] ${s(r['프로그램'])} ${s(r['시작'])}: 비고 "${tk}" 날짜 변환 실패, 제외됨`, s(r['비고'])); return; }
+        dates.forEach(dt => {
           for (let k = 0; k < perDay; k++) {
             made++;
             daily.push({
@@ -362,6 +382,7 @@ code{font-size:12px;background:var(--soft);padding:1px 5px;border-radius:4px}
           }
         });
       });
+      if (badRows.length) W('error', '날짜', `[${sh.sheet}] 방송일(비고) 표기 오류로 제외한 행 ${badRows.length}개 (횟수 ${badRows.reduce((a, b) => a + (b.cnt || 0), 0)}) · ` + badRows.slice(0, 3).map(b => `${s(b.r['프로그램'])} ${s(b.r['시작'])}: ${b.why}`).join(' / ') + (badRows.length > 3 ? ` 외 ${badRows.length - 3}행` : ''), badRows.map(b => `${s(b.r['프로그램'])} ${s(b.r['시작'])} 비고="${s(b.r['비고'])}"`).join('\n'));
       if (declared !== made) W(fixMulti ? 'warn' : 'error', '횟수', `[${sh.sheet}] 큐시트 횟수 합 ${declared} ≠ 생성 행 ${made}`);
       if (sh.spotsDeclared && sh.spotsDeclared !== declared) W('warn', '횟수', `[${sh.sheet}] 상단 송출횟수 ${sh.spotsDeclared} ≠ 표 횟수 합 ${declared}`);
     });
@@ -656,10 +677,24 @@ function loginScreen(msg, sent) {
   document.querySelector('.app').style.display = 'none';
   let box = document.getElementById('login'); if (!box) { box = document.createElement('div'); box.id = 'login'; document.body.appendChild(box); }
   box.innerHTML = `<div style="min-height:100vh;display:grid;place-items:center;padding:24px"><div class="card" style="width:min(420px,100%)"><h2 style="font-size:20px">DRTV 원툴</h2><p class="lead">@${ALLOWED_DOMAIN} 메일로 로그인합니다. 메일 주소를 넣으면 로그인 링크를 보내 드립니다. 비밀번호는 쓰지 않습니다.</p>
-    ${sent ? `<p style="background:var(--ok-soft);padding:10px 12px;border-radius:8px;font-size:13px">${esc(sent)} 로 로그인 링크를 보냈습니다. 같은 브라우저에서 메일의 링크를 누르면 바로 들어옵니다.</p>` : ''}
+    ${sent ? `<p style="background:var(--ok-soft);padding:10px 12px;border-radius:8px;font-size:13px">${esc(sent)} 로 로그인 링크를 보냈습니다. 같은 브라우저에서 메일의 링크를 누르면 바로 들어옵니다.</p>
+    <details style="margin:0 0 12px;font-size:12.5px" open><summary style="cursor:pointer;font-weight:600">메일이 오지 않으면</summary><ol style="margin:6px 0 0;padding-left:18px;line-height:1.7;color:var(--sub)">
+      <li>정크·스팸함과 <b>격리(Quarantine)</b>함을 확인합니다. 보낸 사람: <code>noreply@${esc(((window.DRTV_FIREBASE || {}).authDomain) || '')}</code></li>
+      <li>1~2분 뒤에도 없으면 아래에서 다시 받습니다. 여러 번 누르면 마지막 메일의 링크만 유효합니다.</li>
+      <li>사내망에서만 안 되면 휴대폰(LTE)이나 다른 네트워크에서 같은 방법으로 로그인해 봅니다. 그때 되면 사내 메일·방화벽 설정 문제입니다.</li>
+      ${(window.DRTV_FIREBASE || {}).microsoftTenant ? '<li>메일 없이 들어오려면 아래 <b>Microsoft 365 계정으로 로그인</b>을 씁니다.</li>' : ''}
+    </ol></details>` : ''}
     ${msg ? `<p style="background:var(--err-soft);padding:10px 12px;border-radius:8px;font-size:13px">${esc(msg)}</p>` : ''}
     <label class="note" for="lgEmail">회사 메일</label><input type="text" id="lgEmail" placeholder="이름@${ALLOWED_DOMAIN}" style="width:100%;margin:4px 0 10px" autocomplete="email">
-    <button class="pri" id="lgGo" style="width:100%">로그인 링크 받기</button></div></div>`;
+    <button class="pri" id="lgGo" style="width:100%">${sent ? '로그인 링크 다시 받기' : '로그인 링크 받기'}</button>
+    ${(window.DRTV_FIREBASE || {}).microsoftTenant ? `<div class="note" style="text-align:center;margin:12px 0 8px">또는</div><button id="lgMs" style="width:100%">Microsoft 365 계정으로 로그인 (메일 링크 없이)</button>` : ''}</div></div>`;
+  if (sent) $('#lgEmail').value = sent;
+  const ms = $('#lgMs'); if (ms) ms.onclick = async () => {
+    const cfg = window.DRTV_FIREBASE, pv = new firebase.auth.OAuthProvider('microsoft.com');
+    pv.setCustomParameters({ tenant: cfg.microsoftTenant, prompt: 'select_account', domain_hint: ALLOWED_DOMAIN });
+    try { await firebase.auth().signInWithPopup(pv); }
+    catch (e) { if (e && /popup/.test(e.code || '')) { await firebase.auth().signInWithRedirect(pv); return; } loginScreen('Microsoft 로그인에 실패했습니다: ' + (e.message || e.code)); }
+  };
   const go = async () => {
     const em = $('#lgEmail').value.trim().toLowerCase();
     if (!domainOk(em)) { loginScreen(`@${ALLOWED_DOMAIN} 메일만 로그인할 수 있습니다.`); return; }
@@ -684,10 +719,11 @@ async function bootFirebase() {
   return new Promise(resolve => {
     auth.onAuthStateChanged(async user => {
       if (!user) { loginScreen(''); return; }
-      if (!domainOk(user.email) || !user.emailVerified) { await auth.signOut(); loginScreen(`@${ALLOWED_DOMAIN} 메일 인증이 필요합니다.`); return; }
+      const em = (user.email || ((user.providerData || []).find(p => p.email) || {}).email || '').toLowerCase(), viaMs = (user.providerData || []).some(p => p.providerId === 'microsoft.com');
+      if (!domainOk(em) || !(user.emailVerified || viaMs)) { await auth.signOut(); loginScreen(`@${ALLOWED_DOMAIN} 메일 인증이 필요합니다.`); return; }
       const lb = document.getElementById('login'); if (lb) lb.remove(); document.querySelector('.app').style.display = '';
-      S.user = { email: user.email };
-      S.store = makeFsStore(firebase.firestore(), user.email); S.base = cfg.basePath || 'data/team/springnflower'; S.dl = null;
+      S.user = { email: em };
+      S.store = makeFsStore(firebase.firestore(), em); S.base = cfg.basePath || 'data/team/springnflower'; S.dl = null;
       resolve();
     });
   });
@@ -783,10 +819,20 @@ async function loadImps(bid) {
   const entries = []; for (let i = 0; i < meta.chunks; i++) { const c = await S.store.get(P.impChunk(i, own ? bid : '')); if (c) entries.push(...c.e); }
   return (S.impsRawB[ck] = { entries, meta: meta.meta, own: !!own });
 }
+async function replaceImps(b, f) {
+  const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }), raw = DRTV.parseAvgImpsRaw(XLSX, wb);
+  const cur = impsMetaFor(b.id), tg = b.settings.targetLabel || '4059F', tgs = raw.meta.targets || [];
+  const msg = `${f.name}\n\n평균IMPS ${cur ? '교체' : '등록'} (${b.name} 전용)\n· 기준 기간: ${cur ? (cur.meta.period || '-') + ' → ' : ''}${raw.meta.period || '-'}\n· 키 수: ${cur ? cur.rows.toLocaleString() + ' → ' : ''}${raw.entries.length.toLocaleString()}\n· 파일 타겟: ${tgs.join(', ')}${tgs.includes(tg) ? '' : `\n\n주의: 이 브랜드 타겟 "${tg}" 가 파일에 없습니다. 이대로 쓰면 타겟 시청률이 0으로 들어갑니다.`}\n\n이미 저장한 큐시트 버전과 플랜 DB의 시청률은 바뀌지 않습니다. 다시 변환해 저장·확정한 달부터 새 값이 들어갑니다.\n${cur ? '이전 파일 이름과 기간은 이력에 남습니다.' : ''}`;
+  if (!await askConfirm(msg)) return false;
+  await saveImps(raw, f.name, b.id); toast(`평균IMPS ${cur ? '교체' : '등록'}: ${raw.meta.period || ''} · ${raw.entries.length.toLocaleString()}개 키`); return true;
+}
 async function saveImps(raw, fileName, bid) {
   bid = bid || S.brandId; const N = 3000, chunks = Math.ceil(raw.entries.length / N);
+  const old = S.impsB && S.impsB[bid];
   for (let i = 0; i < chunks; i++) await S.store.set(P.impChunk(i, bid), { e: raw.entries.slice(i * N, (i + 1) * N) });
-  const meta = { chunks, meta: raw.meta, file: fileName, rows: raw.entries.length, at: nowIso() };
+  if (old && old.chunks > chunks) for (let i = chunks; i < old.chunks; i++) await S.store.del(P.impChunk(i, bid));
+  const hist = ((old && old.history) || []).concat(old ? [{ at: old.at, file: old.file, period: old.meta && old.meta.period, rows: old.rows }] : []).slice(-20);
+  const meta = { chunks, meta: raw.meta, file: fileName, rows: raw.entries.length, at: nowIso(), history: hist };
   await S.store.set(P.impMeta(bid), meta); S.impsB = S.impsB || {}; S.impsB[bid] = meta; S.impsRawB = S.impsRawB || {}; S.impsRawB[bid] = { entries: raw.entries, meta: raw.meta, own: true };
 }
 
@@ -961,7 +1007,7 @@ function vDim() {
 function bindDimDrops() {
   const bind = (sel, fn) => { const el = $(sel); const inp = el.querySelector('input'); inp.onchange = () => inp.files[0] && fn(inp.files[0]); el.ondragover = e => { e.preventDefault(); el.classList.add('over'); }; el.ondragleave = () => el.classList.remove('over'); el.ondrop = e => { e.preventDefault(); el.classList.remove('over'); e.dataTransfer.files[0] && fn(e.dataTransfer.files[0]); }; };
   bind('#dDrop', async f => { if (dimDirtyN() && !await askConfirm('저장하지 않은 변경이 있습니다. 벌크 가져오기로 덮어쓸까요?')) return; try { if (S.dims[S.brandId]) { if (await replaceDimension(S.brandId, f, S.ym)) vDim(); return; } const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const d = dimFromWorkbook(wb); d.source = f.name; d.log = []; dimLog(d, `벌크 가져오기: ${f.name}`); await saveDim(S.brandId, d); DW = null; fillGlobals(); toast(`디멘션 저장: 클락 ${d.cm.length}행, 플랜 ${d.mp.length}행, DTV 소재명 ${d.dtv.length}행`); vDim(); } catch (e) { toast('가져오기 실패: ' + e.message); } });
-  bind('#iDrop', async f => { try { toast('평균IMPS 읽는 중'); const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const raw = DRTV.parseAvgImpsRaw(XLSX, wb); await saveImps(raw, f.name, S.brandId); toast(`평균IMPS 저장: ${raw.entries.length.toLocaleString()}개 키, ${raw.meta.period || ''}, 타겟 ${(raw.meta.targets || []).join(', ')}`); vDim(); } catch (e) { toast('가져오기 실패: ' + e.message); } });
+  bind('#iDrop', async f => { try { if (await replaceImps(brand(), f)) vDim(); } catch (e) { toast('가져오기 실패: ' + e.message); } });
 }
 function dimGrid(bid, d, tab) {
   const conf = DIM_CONF[tab];
@@ -1612,6 +1658,7 @@ function vConvert() {
     <div class="row" style="margin-bottom:10px"><span class="pill ${ready ? 'ok' : 'err'}">디멘션 ${ready ? '있음' : '없음'}</span><span class="pill ${impsMetaFor(b.id) ? 'ok' : 'warn'}">평균IMPS ${impsMetaFor(b.id) ? esc(impsMetaFor(b.id).meta.period || '있음') + ((S.impsB && S.impsB[b.id]) ? '' : ' · 공용') : '없음 (시청률 비움)'}</span><span class="pill no">타겟 ${esc(b.settings.targetLabel || '4059F')} · CreKey ${({ cc: '채널+소재', ccd: '채널+소재+초수', ccc: '채널+소재+CTA' })[b.settings.keyMode || 'cc']}${(b.settings.vatDiv || 1.1) === 1 ? ' · 영세율' : ''}</span>${pre}</div>
     ${!ready || !impsMetaFor(b.id) ? `<div class="grid2" style="margin-bottom:12px">${!ready ? `<label class="drop" id="cDim" style="border-color:var(--err)"><input type="file" accept=".xlsx"><b>1. 디멘션 넣기 (필수)</b><small>dimension_v2.xlsx. 한 번 넣으면 ${esc(b.name)} 디멘션으로 DB에 저장됩니다</small></label>` : ''}${!impsMetaFor(b.id) ? `<label class="drop" id="cImp"><input type="file" accept=".xlsx,.xls"><b>${ready ? '' : '2. '}평균IMPS 넣기 (선택)</b><small>${esc(b.name)} 타겟(${esc(b.settings.targetLabel || '4059F')})으로 뽑은 평균imps.xlsx</small></label>` : ''}</div>` : ''}
     ${ready ? `<label class="drop" id="cDimRep" style="margin-bottom:10px;padding:8px 12px"><input type="file" accept=".xlsx"><b style="font-size:13px">수정한 디멘션 파일로 반영</b><small>현재: ${esc(d.source || '')} · ${kst(d.updatedAt)} 저장 · 파일을 넣으면 ${esc(cym || S.ym || '작업월')}만 교체할지 전체 교체할지 고릅니다${S.conv && S.conv.res ? '. 반영 후 바로 다시 변환합니다' : ''}</small></label>` : ''}
+    ${ready && impsMetaFor(b.id) ? `<label class="drop" id="cImpRep" style="margin-bottom:10px;padding:8px 12px"><input type="file" accept=".xlsx,.xls"><b style="font-size:13px">평균IMPS 파일 교체</b><small>현재: ${esc(impsMetaFor(b.id).file || '')} · ${esc(impsMetaFor(b.id).meta.period || '')} · ${kst(impsMetaFor(b.id).at)} 저장${(S.impsB && S.impsB[b.id]) ? '' : ' (공용 파일 사용 중, 교체하면 이 브랜드 전용으로 저장)'}${S.conv && S.conv.res ? '. 교체 후 바로 다시 변환합니다' : ''}</small></label>` : ''}
     <label class="drop" id="cDrop"><input type="file" accept=".xlsx,.xls"><b>매체사 큐시트 넣기</b><small>${S.conv ? esc(S.conv.file) : '채널별 시트가 있는 취합본'}</small></label>
     <div class="row" style="margin-top:12px"><label class="note">집행월 키 <input type="text" id="cYm" value="${esc(S.conv ? S.conv.ym : '')}" style="width:110px"></label><button class="pri" id="cRun" ${S.conv && ready ? '' : 'disabled'}>변환</button><span class="note" id="cMsg"></span></div></div><div id="cOut"></div>`;
   const el = $('#cDrop'), inp = el.querySelector('input');
@@ -1623,6 +1670,7 @@ function vConvert() {
   if (!ready) $('#cMsg').textContent = '디멘션을 먼저 넣어야 변환할 수 있습니다';
   else if (!S.conv) $('#cMsg').textContent = '매체사 큐시트를 넣어 주세요';
   const bindDrop = (sel, fn) => { const el2 = $(sel); if (!el2) return; const i2 = el2.querySelector('input'); i2.onchange = () => i2.files[0] && fn(i2.files[0]); el2.ondragover = e => { e.preventDefault(); el2.classList.add('over'); }; el2.ondragleave = () => el2.classList.remove('over'); el2.ondrop = e => { e.preventDefault(); el2.classList.remove('over'); e.dataTransfer.files[0] && fn(e.dataTransfer.files[0]); }; };
+  bindDrop('#cImpRep', async f => { try { const ok = await replaceImps(b, f); if (!ok) return; if (S.conv && S.conv.res) { vConvert(); await runConvert(); } else vConvert(); } catch (e) { toast('평균IMPS 교체 실패: ' + (e.message || e.code)); } });
   bindDrop('#cDimRep', async f => { try { const ok = await replaceDimension(b.id, f, cym || S.ym); if (!ok) return; if (S.conv && S.conv.res) { vConvert(); await runConvert(); } else vConvert(); } catch (e) { toast('디멘션 반영 실패: ' + (e.message || e.code)); } });
   bindDrop('#cDim', async f => { try { const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const nd = dimFromWorkbook(wb); nd.source = f.name; await saveDim(S.brandId, nd); fillGlobals(); toast(`디멘션 저장: 클락 ${nd.cm.length}행, 플랜 ${nd.mp.length}행`); vConvert(); } catch (e) { toast('디멘션 저장 실패: ' + (e.message || e.code)); } });
   bindDrop('#cImp', async f => { try { toast('평균IMPS 읽는 중'); const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' }); const raw = DRTV.parseAvgImpsRaw(XLSX, wb); await saveImps(raw, f.name, b.id); toast(`평균IMPS 저장: ${raw.entries.length.toLocaleString()}개 키 · 타겟 ${(raw.meta.targets || []).join(', ')}`); vConvert(); } catch (e) { toast('평균IMPS 저장 실패: ' + (e.message || e.code)); } });
