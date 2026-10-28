@@ -8,5 +8,7 @@ window.DRTV_FIREBASE = {
   messagingSenderId: "878878838105",
   appId: "1:878878838105:web:09e7106b4a02ffbca01048",
   allowedDomain: "springnflower.com",
+  microsoftTenant: "",   // (선택) Microsoft 365 로그인을 켤 때 회사 테넌트 ID 입력. 비워 두면 메일 링크 로그인만 표시
+
   basePath: "data/team/springnflower"
 };
